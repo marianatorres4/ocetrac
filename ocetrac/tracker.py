@@ -4,6 +4,8 @@ import scipy.ndimage
 from skimage.measure import regionprops 
 from skimage.measure import label as label_np
 import dask.array as dsa
+from sklearn.metrics.pairwise import haversine_distances
+import pandas as pd
 
 def _apply_mask(binary_images, mask):
     binary_images_with_mask = binary_images.where(mask==1, drop=False, other=0)
@@ -11,10 +13,8 @@ def _apply_mask(binary_images, mask):
 
 class Tracker:
         
-    def __init__(self, da, mask, radius, min_size_quartile, timedim, xdim, ydim, positive=True):
+    def __init__(self, da, mask, radius, min_size_quartile, timedim, xdim = 'xh', ydim = 'yh', positive=True):
         
-        
-
         self.da = da
         self.mask = mask
         self.radius = radius
@@ -90,11 +90,9 @@ class Tracker:
             labels_wrapped = labels
             N_final = np.max(labels)
                 
-
         # Final labels to DataArray
         new_labels = xr.DataArray(labels_wrapped, dims=self.da.dims, coords=self.da.coords)   
         new_labels = new_labels.where(new_labels!=0, drop=False, other=np.nan)
-
 
         ## Metadata
 
@@ -123,9 +121,137 @@ class Tracker:
 
         return new_labels
 
+    def collect_surface_stats(self, labels):
+        """Collects surface statistics"""
+    
+        ids = np.unique(labels)
+        ids = np.array([id for id in ids if ~np.isnan(id)])
+        
+        dataframes = []
+        num_events = len(ids)
+    
+        for i in range(num_events):
+            event = labels.where(labels == ids[i], drop=True)
+            df = self._get_surface_stats(event) #self.da or sst
+            dataframes.append(df)
+            #break
+    
+        dff = pd.concat(dataframes, ignore_index=True)
+        return dff
 
     ### PRIVATE METHODS - not meant to be called by user ###
+
+    def _compute_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[float, float]:
+        """Compute the x and y resolution in km for a geographic degree resolution
     
+        :param clat: the point latitude at which to compute the resolution
+        :param clon: the point longitude at which to compute the resolution
+        :param res: the geographic degree resolution
+        :return: distance in km between two points
+        """
+        
+        dist = haversine_distances(
+            np.deg2rad(np.array([(lat1, lon1)])),
+            np.deg2rad(np.array([(lat2, lon2)])),
+        )
+        
+        dist = dist * 6371000 / 1000  # multiply by Earth radius to get kilometers
+        dist
+        return dist[0][0]
+
+    def _get_surface_stats(self, event):
+        """ get surface stats for one event """
+        
+        # Initialize dictionary 
+        mhw = {}
+        mhw['id'] = [] # event label
+        mhw['dates'] = [] # datetime format
+        mhw['coords'] = [] # (lat, lon)
+        mhw['centroid'] = []  # (lat, lon)
+        mhw['duration'] = [] # [months]
+        mhw['intensity_max'] = [] # [deg C]
+        mhw['intensity_mean'] = [] # [deg C]
+        mhw['intensity_min'] = [] # [deg C]
+        mhw['intensity_cumulative'] = [] # [deg C]
+        mhw['total_area'] = [] # [km2]
+        mhw['distance'] = [] 
+        
+        # TO ADD:
+        # mhw['rate_onset'] = [] # [deg C / month]
+        # mhw['rate_decline'] = [] # [deg C / month]
+        
+        mhw["id"].append(int(np.nanmedian(event.values)))
+        mhw["dates"].append(event.time.values)
+        mhw["duration"] = event.time.shape[0]
+        mhw["total_area"] = int(event.sum("time").count((self.ydim,self.xdim)).values)
+        
+        centroid_list = []
+        distance_list = []
+        
+        prev_coords = None  # Initialize previous coordinates as None
+        
+        for time in event.time.values:
+            mhw_slice = event.sel(time=time)
+            
+            # Create latitude and longitude grids
+            lon_grid, lat_grid = np.meshgrid(np.arange(0, mhw_slice[self.xdim].shape[0]), np.arange(0, mhw_slice[self.ydim].shape[0]))
+            lon_flat = lon_grid.flatten()
+            lat_flat = lat_grid.flatten()
+            data_flat = mhw_slice.values.flatten()
+        
+            # Compute the centroid
+            centroid_lon = np.nansum(lon_flat * data_flat) / np.nansum(data_flat)
+            centroid_lat = np.nansum(lat_flat * data_flat) / np.nansum(data_flat)
+
+            coords = [int(mhw_slice[self.xdim][round(centroid_lon)].values), int(mhw_slice[self.ydim][round(centroid_lat)].values)]
+            centroid_list.append(coords)
+            
+            # Extract lat and lon from the current coordinates
+            lon2, lat2 = coords  # lon2 is the first element, lat2 is the second
+            
+            # Calculate distance from previous coordinates, if available
+            if prev_coords is not None:
+                lon1, lat1 = prev_coords  
+                distance = self._compute_distance(lat1, lon1, lat2, lon2)
+                distance_list.append(distance)
+            
+            prev_coords = coords  
+        
+        # Add a None or NaN for the first distance since it's undefined
+        distance_list.insert(0, np.nan)
+        #distance_list.insert(0, None)  # or use `np.nan` if you prefer
+        
+        mhw['centroid'].append(centroid_list)
+        mhw['distance'].append(distance_list)
+        
+        # Process intensity metrics using try-except to handle ValueError
+        event_ssta = self.da.where(event > 0, drop=True)
+        
+        try:
+            mhw['intensity_mean'].append(event_ssta.mean((self.ydim, self.xdim)).thetao.values)
+        except ValueError:
+            mhw['intensity_mean'].append(np.nan)
+        try:
+            mhw['intensity_max'].append(event_ssta.max((self.ydim, self.xdim)).thetao.values)
+        except ValueError:
+            mhw['intensity_max'].append(np.nan)
+        try:
+            mhw['intensity_min'].append(event_ssta.min((self.ydim, self.xdim)).thetao.values)
+        except ValueError:
+            mhw['intensity_min'].append(np.nan)
+        try:
+            mhw['intensity_cumulative'].append(np.nansum(event_ssta.to_array()))
+        except ValueError:
+            mhw['intensity_cumulative'].append(np.nan)
+            
+        coords = event.stack(z=(self.ydim, self.xdim))
+        coord_pairs = [(coords.isel(time=t[0]).dropna(dim='z', how='any').z[self.ydim].values, 
+                          coords.isel(time=t[0]).dropna(dim='z', how='any').z[self.xdim].values) for t in enumerate(event.time)]
+        
+        mhw['coords'].append(coord_pairs)
+        
+        mhw = pd.DataFrame(dict([(name, pd.Series(data)) for name,data in mhw.items()]))
+        return mhw
 
     def _morphological_operations(self): 
         '''Converts xarray.DataArray to binary, defines structuring element, and performs morphological closing then opening.
@@ -260,4 +386,3 @@ class Tracker:
         N = np.max(labels_wrapped)
 
         return labels_wrapped, N
-
